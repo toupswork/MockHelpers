@@ -284,22 +284,20 @@ public static class MockHelper
   /// <returns>Disposable object that restores all constructors</returns>
   public static DisposeAggregate MakeNoOpCtor<T>()
   {
-    const byte RET_OPCODE = 0xC3;
-    var disposableAggregate = new DisposeAggregate();
-    var ctors = typeof(T).GetConstructors(BindingFlags.Public).Select(x => x.MethodHandle);
-    foreach (var ctor in ctors)
-    {
-      // Ensure the constructor is JIT-compiled
-      RuntimeHelpers.PrepareMethod(ctor);
+    const int jitCompiledOffset = 8 * 2; const byte RET_OPCODE = 0xC3; // x64 RET opcode
 
-      // Get the JIT-compiled address of the constructor
-      var ctorAddress = ctor.GetFunctionPointer();
+    var disposableAggregate = new DisposeAggregate();
+    foreach (var ctor in typeof(T).GetConstructors(BindingFlags.Public | BindingFlags.Instance))
+    {
+      var methodHandle = ctor.MethodHandle;
+      RuntimeHelpers.PrepareMethod(methodHandle);
+      var ctorAddress = Marshal.ReadIntPtr(methodHandle.Value, jitCompiledOffset);
 
       // Change memory protection to allow writing
       RuntimeInterop.UnlockPage(ctorAddress);
 
       disposableAggregate += new CtorRestorer(Marshal.ReadByte(ctorAddress), ctorAddress);
-      // Write the "ret" opcode (0xC3) to the constructor's address
+
       Marshal.WriteByte(ctorAddress, RET_OPCODE);
     }
 
@@ -346,26 +344,23 @@ public static class MockHelper
 
   static void GetJiTMethodAddress(MethodInfo source, out IntPtr address)
   {
-    var methodHandle = source.MethodHandle;
+    const int jitCompiledOffset = 8 * 2;
+    var (methodHandle, methodHandleValue)  = (source.MethodHandle, source.MethodHandle.Value);
     RuntimeHelpers.PrepareMethod(methodHandle);
-    address = Marshal.ReadIntPtr(methodHandle.Value, IntPtr.Size * 2);
+    address = Marshal.ReadIntPtr(methodHandleValue, jitCompiledOffset);
   }
 
   static MethodInfo FindMatchingMethodInfo(Type type, MethodInfo mi) =>
     type.GetMethods()
-        .Where(x => x.Name == mi.Name)
+        .Where(x => x.Name == mi.Name && x.Attributes == mi.Attributes)
         .Where(x => x.ReturnType == mi.ReturnType)
-        .Where(x => x.IsVirtual)
-        .Where(x => x.GetParameters()
-                     .Select(p => p.ParameterType)
+        .Where(x => x.GetParameters().Select(p => p.ParameterType)
                      .SequenceEqual(mi.GetParameters().Select(x => x.ParameterType)))
-        .Where(x => x.IsGenericMethod == mi.IsGenericMethod &&
-                    x.GetGenericArguments().Length == mi.GetGenericArguments().Length)
         .ToList() is [{ } first] ? first : null;
-
+  
   private static IDisposable RedirectVirtualMethod(Type source, MethodInfo sourceMi, MethodInfo targetMethod)
   {
-    const int methodTableFirstMethodOffset = 0x40;// 64 bytes offset
+    const int methodTableFirstMethodOffset = 64;
 
     var sourceMethod = FindMatchingMethodInfo(source, sourceMi);
     ArgumentNullException.ThrowIfNull(sourceMethod, "Could not find matching virtual method in source");
@@ -373,16 +368,13 @@ public static class MockHelper
     RuntimeHelpers.PrepareMethod(sourceMethod.MethodHandle);
 
     // Get the slot index of the virtual method
-    var (slotIndex, methodTable) = (RuntimeInterop.GetSlot(sourceMethod), source.TypeHandle.Value);
+    var methodTable =  source.TypeHandle.Value;
     var firstMethodIndex = Marshal.ReadIntPtr(methodTable + methodTableFirstMethodOffset);
 
     // Calculate the vtable slot address
-    var vtableSlotPtr = firstMethodIndex + (IntPtr.Size * slotIndex);
+    RuntimeInterop.GetSlot(sourceMethod, out var slotIndex);
+    var vtableSlotPtr = firstMethodIndex + (8 * slotIndex);
     var sourceAddress = Marshal.ReadIntPtr(vtableSlotPtr);
-
-    // Change memory protection to allow writing
-    if (!RuntimeInterop.UnlockPage(sourceAddress))
-      throw new InvalidOperationException("Failed to unlock page for virtual method table slot address");
 
     GetJiTMethodAddress(targetMethod, out var targetAddress);
     OverwriteSourcePreambleWithStub(sourceAddress, targetAddress, out var binaryBackup);
@@ -421,25 +413,24 @@ file static class RuntimeInterop
                                                  .Where(x => x.GetParameters() is [{ } input] &&
                                                              input.ParameterType == _iRuntimeMethodInfoType)
                                                  .ToList() is [{ } mi] ? mi : null;
-  public static int GetSlot(MethodInfo method)
+
+  public static void GetSlot(MethodInfo method, out int slot) =>
+    GetSlotMi.Invoke(null, [method]).TryUnbox(out slot);
+  
+  private enum PageAttributes : uint
   {
-    GetSlotMi.Invoke(null, [method]).TryUnbox<int>(out var value);
-    return value;
+    //PAGE_NOACCESS = 0x01,
+    //PAGE_READONLY = 0x02,
+    //PAGE_READWRITE = 0x04,
+    //PAGE_WRITECOPY = 0x08,
+    //PAGE_EXECUTE = 0x10,
+    //PAGE_EXECUTE_READ = 0x20,
+    PAGE_EXECUTE_READWRITE = 0x40,
+    //PAGE_EXECUTE_WRITECOPY = 0x80,
+    //PAGE_GUARD = 0x100,
+    //PAGE_NOCACHE = 0x200,
+    //PAGE_WRITECOMBINE = 0x400
   }
-  //private enum PageAttributes : uint
-  //{
-  //  PAGE_NOACCESS = 0x01,
-  //  PAGE_READONLY = 0x02,
-  //  PAGE_READWRITE = 0x04,
-  //  PAGE_WRITECOPY = 0x08,
-  //  PAGE_EXECUTE = 0x10,
-  //  PAGE_EXECUTE_READ = 0x20,
-  //  PAGE_EXECUTE_READWRITE = 0x40,
-  //  PAGE_EXECUTE_WRITECOPY = 0x80,
-  //  PAGE_GUARD = 0x100,
-  //  PAGE_NOCACHE = 0x200,
-  //  PAGE_WRITECOMBINE = 0x400
-  //}
   [DllImport("kernel32.dll", EntryPoint = "VirtualProtect", SetLastError = true)]
   static extern bool VirtualProtectWindows(IntPtr lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
@@ -454,14 +445,17 @@ file static class RuntimeInterop
 
   private static bool UnlockPageLinux(IntPtr address)
   {
-    var newAddress = (address) & (long)(~0 << 12);
-    var na = (IntPtr)newAddress;
-    var length = ((long)address) + 6 - newAddress;
-    // 1 for read, 2 for write, 4 for execute
-    return VirtualProtectLinux(na, (uint)length, 1 | 2 | 4) > 0;
+    const int linuxReadWriteExecuteFlag = 1 | 2 | 4;
+
+    // Align address to 4K boundary
+    var newAddress = address & (long)(~0 << 12);
+
+    var (na,length) = ((IntPtr)newAddress, (long)address + 6 - newAddress);
+    
+    return VirtualProtectLinux(na, (uint)length, linuxReadWriteExecuteFlag) == 0;
   }
   private static bool UnlockPageWindows(IntPtr address) =>
-    VirtualProtectWindows(address, 6, 0x40, out _);
+    VirtualProtectWindows(address, 6, (uint)PageAttributes.PAGE_EXECUTE_READWRITE, out _);
 
 
 }
