@@ -9,6 +9,36 @@ using System.Runtime.InteropServices;
 using CommunityToolkit.Diagnostics;
 using CommunityToolkit.HighPerformance.Helpers;
 
+// So now this supports: Static methods, Generic methods, Virtual methods, Extension Methods!!
+
+
+/// Example of how to use
+
+MockHelper.RedirectGenericMethodUnsafe(() => Fake.Deserialize<int>(""), () => Fake2.Deserialize<int>("")); // values in the expression do not matter
+
+Fake.Deserialize<int>(""); // will invoke Fake2
+Fake2.Deserialize<int>(""); // will invoke Fake2
+
+
+public static class Fake
+{
+  public static TValue? Deserialize<TValue>(string json) where TValue: struct
+  {
+    return default;
+  }
+
+}
+public static class Fake2
+{
+  public static TValue Deserialize<TValue>(string json) where TValue : struct
+  {
+    return default;
+  }
+
+}
+///////////////////////////////////////////
+
+
 
 /// <summary>
 /// For the provided type, create an expression to invoke the method. The values you provide are not used: they are only provided
@@ -213,6 +243,38 @@ public static class MockHelper
       return RedirectVirtualMethod(typeof(TSource), srcMethod, destMethod);
 
     return ReplaceFunction(srcMethod, destMethod);
+  }
+  // ⭐ NEW: Support for Generics
+  public static IDisposable RedirectGenericMethodUnsafe(Expression<Action> pickSourceMethod, Expression<Action> pickDestinationMethod) 
+  {
+    if ((pickSourceMethod, pickDestinationMethod) is not (
+        { Body: MethodCallExpression { Method: { } srcMethod } },
+        { Body: MethodCallExpression { Method: { } destMethod } }))
+      throw new ArgumentException("Both expressions must be a method call");
+
+    return RedirectGenericMethod(srcMethod, destMethod);
+  }
+  
+  private static IDisposable RedirectGenericMethod(MethodInfo source, MethodInfo dest)
+  {
+    // get all generic arguments
+    var (srcGenArgs, dstGenArgs) = (source.GetGenericArguments(), dest.GetGenericArguments());
+    // get the source generic method from the parent type
+    (source, dest) = (source.GetGenericMethodDefinition(), dest.GetGenericMethodDefinition());
+    // apply the generic arguments to make them bound to do the specific generic arguments
+    (source, dest) = (source.MakeGenericMethod(srcGenArgs), dest.MakeGenericMethod(dstGenArgs));
+    // Trigger the runtime to JiT the source and destination methods, passing the in type handles for the generic arguments
+    // The 2nd argument tells the runtime exactly what generic types of the method are to be JiT compiled, so excluding it will
+    // result in the pre-compile stub being called rather than the JIT offset
+    RuntimeHelpers.PrepareMethod(source.MethodHandle, [..srcGenArgs.Select(x=>x.TypeHandle)]);
+    RuntimeHelpers.PrepareMethod(dest.MethodHandle, [..dstGenArgs.Select(x => x.TypeHandle)]);
+
+    // For generic methods, the function pointers must come from the method handle directly
+    var (srcAddress, destAddress) = (source.MethodHandle.GetFunctionPointer(), dest.MethodHandle.GetFunctionPointer());
+
+    // Overwrite the JiT-compiled entry in the Method Descriptor with the redirect x64 assembly-code stub
+    OverwriteSourcePreambleWithStub(srcAddress, destAddress, out var binaryBackup);
+    return new MethodRestorer(srcAddress, binaryBackup);
   }
   /// <summary>
   /// Configures all public constructors to do nothing so that you can bypass any
